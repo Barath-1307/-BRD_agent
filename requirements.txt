@@ -1,0 +1,15 @@
+beautifulsoup4
+playwright
+sentence-transformers
+faiss-cpu
+numpy
+aiohttp
+requests
+torch
+transformers
+huggingface_hub
+python-dotenv
+openai
+anthropic-sdk
+google-api-python-client
+autogenstudio

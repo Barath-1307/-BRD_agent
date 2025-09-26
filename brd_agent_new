@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+import argparse
+import asyncio
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+# AutoGen Studio runtime
+from autogenstudio.teammanager import TeamManager
+
+
+# Map a provider flag to the AutoGen Studio model client + a default model id.
+# If your Studio uses slightly different class paths, copy them from your exported team.json.
+PROVIDERS = {
+    "openai": (
+        "autogen_ext.models.openai.OpenAIChatCompletionClient",
+        "gpt-4o-mini",
+        "OPENAI_API_KEY",
+    ),
+    "gemini": (
+        "autogen_ext.models.google.GeminiChatClient",
+        "gemini-2.5-pro",
+        "GEMINI_API_KEY",  # or GOOGLE_API_KEY depending on your setup
+    ),
+    "claude": (
+        "autogen_ext.models.anthropic.ClaudeMessagesClient",
+        "claude-3-5-sonnet",
+        "ANTHROPIC_API_KEY",
+    ),
+}
+
+
+def patch_team(team_dict: dict, provider: str, model: str | None) -> dict:
+    """Rewrite the model client provider + model id for the first participant (your brd_agent)."""
+    mc_provider, default_model, _ = PROVIDERS[provider]
+
+    participants = team_dict.get("config", {}).get("participants", [])
+    if not participants:
+        raise ValueError("No participants found in team.json")
+
+    # Find the first agent participant (we assume your brd_agent is the first; adjust if needed)
+    agent_cfg = participants[0].get("config", {})
+    if "model_client" not in agent_cfg:
+        raise ValueError("team.json participant has no model_client section")
+
+    agent_cfg["model_client"]["provider"] = mc_provider
+    agent_cfg["model_client"].setdefault("config", {})
+    agent_cfg["model_client"]["config"]["model"] = model or default_model
+    return team_dict
+
+
+def build_task_text(src_text: str) -> str:
+    """Create the single prompt message for the agent (uses your BRD structure)."""
+    today = datetime.now().strftime("%d %b %Y")
+    return (
+        "Generate a Business Requirements Document (BRD) from the following source text.\n\n"
+        "Constraints:\n"
+        "- Use ONLY this content; do NOT invent facts.\n"
+        '- If information is missing, write "TBD".\n\n'
+        "BRD sections:\n"
+        "1. Executive Summary\n"
+        "2. Objectives & Success Criteria\n"
+        "3. Scope\n"
+        "4. Assumptions & Dependencies\n"
+        "5. Functional Requirements\n"
+        "6. Data Model\n"
+        "7. Non-Functional Requirements\n"
+        "8. Acceptance Criteria\n\n"
+        "Title header:\n"
+        "Business Requirements Document (BRD)\n"
+        "Project: Geofencing\n"
+        "Version: 1.0\n"
+        f"Date: {today}\n"
+        "Owner: <Your Org / Product Manager>\n\n"
+        "----- SOURCE TEXT BELOW -----\n"
+        f"{src_text}\n"
+    )
+
+
+def write_output(markdown_text: str, out_path: Path | None) -> Path:
+    if out_path is None:
+        out_path = Path(f"BRD_Geofencing_{datetime.now().date().isoformat()}.md")
+    out_path.write_text(markdown_text, encoding="utf-8")
+    return out_path
+
+
+async def main():
+    ap = argparse.ArgumentParser(description="Run BRD Generator Team with provider flags")
+    ap.add_argument("--team", default="team.json", help="Base team JSON exported from AutoGen Studio")
+    ap.add_argument("--provider", choices=list(PROVIDERS.keys()), required=True, help="LLM provider")
+    ap.add_argument("--model", help="Override model id (optional)")
+    ap.add_argument("--input", required=True, help="Path to your geofencing .txt")
+    ap.add_argument("--output", help="Path to save the BRD .md (optional)")
+    args = ap.parse_args()
+
+    # Sanity checks for API keys (warn if missing)
+    _, _, api_env = PROVIDERS[args.provider]
+    if not os.getenv(api_env):
+        print(
+            f"WARNING: {api_env} is not set in your environment. The provider may fail to authenticate.",
+            file=sys.stderr,
+        )
+
+    # Load source text
+    src_path = Path(args.input)
+    if not src_path.exists():
+        print(f"ERROR: input file not found: {src_path}", file=sys.stderr)
+        sys.exit(1)
+    src = src_path.read_text(encoding="utf-8")
+    if not src.strip():
+        print("ERROR: input file is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    # Load and patch team.json
+    team_path = Path(args.team)
+    if not team_path.exists():
+        print(f"ERROR: team file not found: {team_path}", file=sys.stderr)
+        sys.exit(1)
+    team_dict = json.loads(team_path.read_text(encoding="utf-8"))
+    team_dict = patch_team(team_dict, args.provider, args.model)
+
+    # Build the task message from the file content
+    task = build_task_text(src)
+
+    # Write patched team to a temp file for TeamManager
+    with tempfile.NamedTemporaryFile("w+", suffix=".json", delete=False, encoding="utf-8") as tf:
+        json.dump(team_dict, tf, ensure_ascii=False, indent=2)
+        tf.flush()
+        tmp_team_path = Path(tf.name)
+
+    # Run the team
+    manager = TeamManager()
+    try:
+        result = await manager.run(task=task, team_config=str(tmp_team_path))
+    finally:
+        try:
+            os.remove(tmp_team_path)
+        except Exception:
+            pass
+
+    # result is typically a string containing the assistant's final message
+    if not isinstance(result, str):
+        result = str(result)
+
+    out_path = write_output(result, Path(args.output) if args.output else None)
+    print(f"✅ BRD written to: {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
